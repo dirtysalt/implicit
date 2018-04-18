@@ -32,7 +32,6 @@ def augment_inner_product_matrix(factors):
 
 
 class NMSLibAlternatingLeastSquares(AlternatingLeastSquares):
-
     """ Speeds up the base :class:`~implicit.als.AlternatingLeastSquares` model by using
     `NMSLib <https://github.com/searchivarius/nmslib>`_ to create approximate nearest neighbours
     indices of the latent factors.
@@ -155,7 +154,6 @@ class NMSLibAlternatingLeastSquares(AlternatingLeastSquares):
 
 
 class AnnoyAlternatingLeastSquares(AlternatingLeastSquares):
-
     """A version of the :class:`~implicit.als.AlternatingLeastSquares` model that uses an
     `Annoy <https://github.com/spotify/annoy>`_ index to calculate similar items and
     recommend items.
@@ -229,7 +227,7 @@ class AnnoyAlternatingLeastSquares(AlternatingLeastSquares):
         # transform distances back to cosine from euclidean distance
         return zip(neighbours, 1 - (numpy.array(dist) ** 2) / 2)
 
-    def recommend(self, userid, user_items, N=10, filter_items=None, recalculate_user=False):
+    def recommend(self, userid, user_items, N=10, filter_items=None, recalculate_user=False, cross_validate=False):
         if not self.approximate_recommend:
             return super(AnnoyAlternatingLeastSquares,
                          self).recommend(userid, user_items, N=N,
@@ -240,7 +238,10 @@ class AnnoyAlternatingLeastSquares(AlternatingLeastSquares):
 
         # calculate the top N items, removing the users own liked items from
         # the results
-        liked = set(user_items[userid].indices)
+        if cross_validate:
+            liked = set()
+        else:
+            liked = set(user_items[userid].indices)
         if filter_items:
             liked.update(filter_items)
         count = N + len(liked)
@@ -257,7 +258,6 @@ class AnnoyAlternatingLeastSquares(AlternatingLeastSquares):
 
 
 class FaissAlternatingLeastSquares(AlternatingLeastSquares):
-
     """ Speeds up the base :class:`~implicit.als.AlternatingLeastSquares` model by using
     `Faiss <https://github.com/facebookresearch/faiss>`_ to create approximate nearest neighbours
     indices of the latent factors.
