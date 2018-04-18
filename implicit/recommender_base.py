@@ -85,6 +85,7 @@ class MatrixFactorizationBase(RecommenderBase):
     user_factors : ndarray
         Array of latent factors for each user in the training set
      """
+
     def __init__(self):
         # learned parameters
         self.item_factors = None
@@ -93,11 +94,14 @@ class MatrixFactorizationBase(RecommenderBase):
         # cache of item norms (useful for calculating similar items)
         self._item_norms = None
 
-    def recommend(self, userid, user_items, N=10, filter_items=None, recalculate_user=False):
+    def recommend(self, userid, user_items, N=10, filter_items=None, recalculate_user=False, cross_validation=False):
         user = self._user_factor(userid, user_items, recalculate_user)
 
         # calculate the top N items, removing the users own liked items from the results
-        liked = set(user_items[userid].indices)
+        if cross_validation:
+            liked = set()
+        else:
+            liked = set(user_items[userid].indices)
         scores = self.item_factors.dot(user)
         if filter_items:
             liked.update(filter_items)
@@ -109,6 +113,11 @@ class MatrixFactorizationBase(RecommenderBase):
         else:
             best = sorted(enumerate(scores), key=lambda x: -x[1])
         return list(itertools.islice((rec for rec in best if rec[0] not in liked), N))
+
+    def compute_scores(self, user_id, user_items, recalculate_user=False):
+        user = self._user_factor(user_id, user_items, recalculate_user)
+        scores = self.item_factors.dot(user)
+        return scores
 
     recommend.__doc__ = RecommenderBase.recommend.__doc__
 
