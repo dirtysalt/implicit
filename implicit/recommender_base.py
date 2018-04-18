@@ -94,14 +94,10 @@ class MatrixFactorizationBase(RecommenderBase):
         # cache of item norms (useful for calculating similar items)
         self._item_norms = None
 
-    def recommend(self, userid, user_items, N=10, filter_items=None, recalculate_user=False, cross_validation=False):
+    def recommend(self, userid, user_items, N=10, filter_items=None, recalculate_user=False):
         user = self._user_factor(userid, user_items, recalculate_user)
 
-        # calculate the top N items, removing the users own liked items from the results
-        if cross_validation:
-            liked = set()
-        else:
-            liked = set(user_items[userid].indices)
+        liked = set(user_items[userid].indices)
         scores = self.item_factors.dot(user)
         if filter_items:
             liked.update(filter_items)
