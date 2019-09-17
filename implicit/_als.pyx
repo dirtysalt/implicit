@@ -97,7 +97,10 @@ def _least_squares(integral[:] indptr, integral[:] indices, float[:] data,
 
                     # b += Yi Cui Pui
                     # Pui is implicit, its defined to be 1 for non-zero entries
-                    axpy(&factors, &confidence, &Y[i, 0], &one, b, &one)
+                    if confidence > 0:
+                        axpy(&factors, &confidence, &Y[i, 0], &one, b, &one)
+                    else:
+                        confidence = -1 * confidence
 
                     # A += Yi^T Cui Yi
                     # Since we've already added in YtY, we subtract 1 from confidence
@@ -170,11 +173,21 @@ def _least_squares_cg(integral[:] indptr, integral[:] indices, float[:] data,
                 for index in range(indptr[u], indptr[u + 1]):
                     i = indices[index]
                     confidence = data[index]
-                    temp = confidence - (confidence - 1) * dot(&N, &Y[i, 0], &one, x, &one)
+
+                    if confidence > 0:
+                        temp = confidence
+                    else:
+                        temp = 0
+                        confidence = -1 * confidence
+
+                    temp = temp - (confidence - 1) * dot(&N, &Y[i, 0], &one, x, &one)
                     axpy(&N, &temp, &Y[i, 0], &one, r, &one)
 
                 memcpy(p, r, sizeof(floating) * N)
                 rsold = dot(&N, r, &one, r, &one)
+
+                if rsold < 1e-20:
+                    continue
 
                 for it in range(cg_steps):
                     # calculate Ap = YtCuYp - without actually calculating YtCuY
@@ -184,6 +197,10 @@ def _least_squares_cg(integral[:] indptr, integral[:] indices, float[:] data,
                     for index in range(indptr[u], indptr[u + 1]):
                         i = indices[index]
                         confidence = data[index]
+
+                        if confidence < 0:
+                            confidence = -1 * confidence
+
                         temp = (confidence - 1) * dot(&N, &Y[i, 0], &one, p, &one)
                         axpy(&N, &temp, &Y[i, 0], &one, Ap, &one)
 
@@ -198,7 +215,7 @@ def _least_squares_cg(integral[:] indptr, integral[:] indices, float[:] data,
                     axpy(&N, &temp, Ap, &one, r, &one)
 
                     rsnew = dot(&N, r, &one, r, &one)
-                    if rsnew < 1e-10:
+                    if rsnew < 1e-20:
                         break
 
                     # p = r + (rsnew/rsold) * p
@@ -247,8 +264,13 @@ def _calculate_loss(Cui, integral[:] indptr, integral[:] indices, float[:] data,
                     i = indices[index]
                     confidence = data[index]
 
-                    temp = (confidence - 1) * dot(&N, &Y[i, 0], &one, &X[u, 0],
-                                                  &one) - 2 * confidence
+                    if confidence > 0:
+                        temp = -2 * confidence
+                    else:
+                        temp = 0
+                        confidence = -1 * confidence
+
+                    temp = temp + (confidence - 1) * dot(&N, &Y[i, 0], &one, &X[u, 0], &one)
                     axpy(&N, &temp, &Y[i, 0], &one, r, &one)
 
                     total_confidence += confidence

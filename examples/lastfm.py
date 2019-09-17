@@ -2,29 +2,24 @@
 from the last.fm dataset. More details can be found
 at http://www.benfrederickson.com/matrix-factorization/
 
-The dataset here can be found at
-http://www.dtic.upf.edu/~ocelma/MusicRecommendationDataset/lastfm-360K.html
-
-Note there are some invalid entries in this dataset, running
-this function will clean it up so pandas can read it:
-https://github.com/benfred/bens-blog-code/blob/master/distance-metrics/musicdata.py#L39
+This code will automically download a HDF5 version of the dataset from
+GitHub when it is first run. The original dataset can also be found at
+http://www.dtic.upf.edu/~ocelma/MusicRecommendationDataset/lastfm-360K.html.
 """
-
-from __future__ import print_function
-
 import argparse
 import codecs
 import logging
 import time
 
-import numpy
-import pandas
-from scipy.sparse import coo_matrix
+import numpy as np
+import tqdm
 
 from implicit.als import AlternatingLeastSquares
 from implicit.approximate_als import (AnnoyAlternatingLeastSquares, FaissAlternatingLeastSquares,
                                       NMSLibAlternatingLeastSquares)
 from implicit.bpr import BayesianPersonalizedRanking
+from implicit.datasets.lastfm import get_lastfm
+from implicit.lmf import LogisticMatrixFactorization
 from implicit.nearest_neighbours import (BM25Recommender, CosineRecommender,
                                          TFIDFRecommender, bm25_weight)
 
@@ -36,56 +31,35 @@ MODELS = {"als":  AlternatingLeastSquares,
           "tfidf": TFIDFRecommender,
           "cosine": CosineRecommender,
           "bpr": BayesianPersonalizedRanking,
+          "lmf": LogisticMatrixFactorization,
           "bm25": BM25Recommender}
 
 
 def get_model(model_name):
+    print("getting model %s" % model_name)
     model_class = MODELS.get(model_name)
     if not model_class:
         raise ValueError("Unknown Model '%s'" % model_name)
 
     # some default params
     if issubclass(model_class, AlternatingLeastSquares):
-        params = {'factors': 64, 'dtype': numpy.float32, 'use_gpu': False}
+        params = {'factors': 16, 'dtype': np.float32}
     elif model_name == "bm25":
         params = {'K1': 100, 'B': 0.5}
     elif model_name == "bpr":
-        params = {'factors': 63, 'use_gpu': False}
+        params = {'factors': 63}
+    elif model_name == "lmf":
+        params = {'factors': 30, "iterations": 40, "regularization": 1.5}
     else:
         params = {}
 
     return model_class(**params)
 
 
-def read_data(filename):
-    """ Reads in the last.fm dataset, and returns a tuple of a pandas dataframe
-    and a sparse matrix of artist/user/playcount """
-    # read in triples of user/artist/playcount from the input dataset
-    # get a model based off the input params
-    start = time.time()
-    logging.debug("reading data from %s", filename)
-    data = pandas.read_table(filename,
-                             usecols=[0, 2, 3],
-                             names=['user', 'artist', 'plays'],
-                             na_filter=False)
-
-    # map each artist and user to a unique numeric value
-    data['user'] = data['user'].astype("category")
-    data['artist'] = data['artist'].astype("category")
-
-    # create a sparse matrix of all the users/plays
-    plays = coo_matrix((data['plays'].astype(numpy.float32),
-                       (data['artist'].cat.codes.copy(),
-                        data['user'].cat.codes.copy())))
-
-    logging.debug("read data file in %s", time.time() - start)
-    return data, plays
-
-
-def calculate_similar_artists(input_filename, output_filename, model_name="als"):
+def calculate_similar_artists(output_filename, model_name="als"):
     """ generates a list of similar artists in lastfm by utiliizing the 'similar_items'
     api of the models """
-    df, plays = read_data(input_filename)
+    artists, users, plays = get_lastfm()
 
     # create a model from the input data
     model = get_model(model_name)
@@ -109,26 +83,29 @@ def calculate_similar_artists(input_filename, output_filename, model_name="als")
     logging.debug("trained model '%s' in %0.2fs", model_name, time.time() - start)
 
     # write out similar artists by popularity
-    artists = dict(enumerate(df['artist'].cat.categories))
     start = time.time()
     logging.debug("calculating top artists")
-    user_count = df.groupby('artist').size()
-    to_generate = sorted(list(artists), key=lambda x: -user_count[x])
+
+    user_count = np.ediff1d(plays.indptr)
+    to_generate = sorted(np.arange(len(artists)), key=lambda x: -user_count[x])
 
     # write out as a TSV of artistid, otherartistid, score
-    with codecs.open(output_filename, "w", "utf8") as o:
-        for artistid in to_generate:
-            artist = artists[artistid]
-            for other, score in model.similar_items(artistid, 11):
-                o.write("%s\t%s\t%s\n" % (artist, artists[other], score))
+    logging.debug("writing similar items")
+    with tqdm.tqdm(total=len(to_generate)) as progress:
+        with codecs.open(output_filename, "w", "utf8") as o:
+            for artistid in to_generate:
+                artist = artists[artistid]
+                for other, score in model.similar_items(artistid, 11):
+                    o.write("%s\t%s\t%s\n" % (artist, artists[other], score))
+                progress.update(1)
 
     logging.debug("generated similar artists in %0.2fs",  time.time() - start)
 
 
-def calculate_recommendations(input_filename, output_filename, model_name="als"):
+def calculate_recommendations(output_filename, model_name="als"):
     """ Generates artist recommendations for each user in the dataset """
     # train the model based off input params
-    df, plays = read_data(input_filename)
+    artists, users, plays = get_lastfm()
 
     # create a model from the input data
     model = get_model(model_name)
@@ -152,22 +129,21 @@ def calculate_recommendations(input_filename, output_filename, model_name="als")
     logging.debug("trained model '%s' in %0.2fs", model_name, time.time() - start)
 
     # generate recommendations for each user and write out to a file
-    artists = dict(enumerate(df['artist'].cat.categories))
     start = time.time()
     user_plays = plays.T.tocsr()
-    with codecs.open(output_filename, "w", "utf8") as o:
-        for userid, username in enumerate(df['user'].cat.categories):
-            for artistid, score in model.recommend(userid, user_plays):
-                o.write("%s\t%s\t%s\n" % (username, artists[artistid], score))
+    with tqdm.tqdm(total=len(users)) as progress:
+        with codecs.open(output_filename, "w", "utf8") as o:
+            for userid, username in enumerate(users):
+                for artistid, score in model.recommend(userid, user_plays):
+                    o.write("%s\t%s\t%s\n" % (username, artists[artistid], score))
+                progress.update(1)
     logging.debug("generated recommendations in %0.2fs",  time.time() - start)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generates similart artists on the last.fm dataset"
+    parser = argparse.ArgumentParser(description="Generates similar artists on the last.fm dataset"
                                      " or generates personalized recommendations for each user",
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--input', type=str,
-                        dest='inputfile', help='last.fm dataset file', required=True)
     parser.add_argument('--output', type=str, default='similar-artists.tsv',
                         dest='outputfile', help='output file name')
     parser.add_argument('--model', type=str, default='als',
@@ -183,6 +159,6 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
 
     if args.recommend:
-        calculate_recommendations(args.inputfile, args.outputfile, model_name=args.model)
+        calculate_recommendations(args.outputfile, model_name=args.model)
     else:
-        calculate_similar_artists(args.inputfile, args.outputfile, model_name=args.model)
+        calculate_similar_artists(args.outputfile, model_name=args.model)

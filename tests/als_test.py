@@ -3,7 +3,7 @@ from __future__ import print_function
 import unittest
 
 import numpy as np
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix, random
 
 from implicit.als import AlternatingLeastSquares
 from implicit.cuda import HAS_CUDA
@@ -14,7 +14,7 @@ from .recommender_base_test import TestRecommenderBaseMixin
 class ALSTest(unittest.TestCase, TestRecommenderBaseMixin):
 
     def _get_model(self):
-        return AlternatingLeastSquares(factors=3, regularization=0)
+        return AlternatingLeastSquares(factors=3, regularization=0, use_gpu=False)
 
     def test_cg_nan(self):
         # test issue with CG code that was causing NaN values in output:
@@ -37,12 +37,30 @@ class ALSTest(unittest.TestCase, TestRecommenderBaseMixin):
                                             regularization=0.01,
                                             dtype=np.float64,
                                             use_native=use_native,
-                                            use_cg=True)
-            model.fit(counts)
+                                            use_cg=True,
+                                            use_gpu=False)
+            model.fit(counts, show_progress=False)
             rows, cols = model.item_factors, model.user_factors
 
             self.assertFalse(np.isnan(np.sum(cols)))
             self.assertFalse(np.isnan(np.sum(rows)))
+
+    def test_cg_nan2(self):
+        # test out Nan appearing in CG code (from https://github.com/benfred/implicit/issues/106)
+        Ciu = random(m=100, n=100, density=0.0005, format='coo', dtype=np.float32,
+                     random_state=42, data_rvs=None).T.tocsr()
+
+        configs = [{'use_native': True, 'use_gpu': False}, {'use_native': False, 'use_gpu': False}]
+        if HAS_CUDA:
+            configs.append({'use_gpu': True})
+
+        for options in configs:
+            model = AlternatingLeastSquares(factors=32, regularization=10, iterations=10,
+                                            dtype=np.float32, **options)
+            model.fit(Ciu, show_progress=False)
+
+            self.assertTrue(np.isfinite(model.item_factors).all())
+            self.assertTrue(np.isfinite(model.user_factors).all())
 
     def test_factorize(self):
         counts = csr_matrix([[1, 1, 0, 1, 0, 0],
@@ -74,7 +92,7 @@ class ALSTest(unittest.TestCase, TestRecommenderBaseMixin):
                                                 use_cg=use_cg,
                                                 use_gpu=use_gpu)
                 np.random.seed(23)
-                model.fit(user_items)
+                model.fit(user_items, show_progress=False)
                 rows, cols = model.item_factors, model.user_factors
 
             except Exception as e:
@@ -109,7 +127,7 @@ class ALSTest(unittest.TestCase, TestRecommenderBaseMixin):
                                         use_cg=False,
                                         iterations=100)
         np.random.seed(23)
-        model.fit(user_items)
+        model.fit(user_items, show_progress=False)
 
         userid = 0
 
@@ -139,6 +157,32 @@ class ALSTest(unittest.TestCase, TestRecommenderBaseMixin):
         self.assertAlmostEqual(score, top_score_explained, 4)
         self.assertEqual(scores[:2], top_scores)
         self.assertEqual(items[:2], top_items)
+
+    def test_recommend_all(self):
+        item_users = self.get_checker_board(50)
+        user_items = item_users.T.tocsr()
+
+        model = self._get_model()
+        model.fit(item_users, show_progress=False)
+
+        recs = model.recommend_all(user_items, N=1, show_progress=False)
+        for userid in range(50):
+            self.assertEqual(len(recs[userid]), 1)
+
+            # the top item recommended should be the same as the userid:
+            # its the one withheld item for the user that is liked by
+            # all the other similar users
+            self.assertEqual(recs[userid][0], userid)
+
+        # try asking for more items than possible
+        self.assertRaises(ValueError, model.recommend_all, user_items, N=10000, show_progress=False)
+        self.assertRaises(
+            ValueError, model.recommend_all, user_items, filter_items=list(range(10000)),
+            show_progress=False)
+
+        # filter recommended items using an additional filter list
+        recs = model.recommend_all(user_items, N=1, filter_items=[0], show_progress=False)
+        self.assertTrue(0 not in recs)
 
 
 if __name__ == "__main__":

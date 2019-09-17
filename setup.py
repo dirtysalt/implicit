@@ -10,7 +10,7 @@ from cuda_setup import CUDA, build_ext
 
 
 NAME = 'implicit'
-VERSION = '0.3.4'
+VERSION = "0.4.0"
 
 try:
     from Cython.Build import cythonize
@@ -52,7 +52,12 @@ def define_extensions(use_cython=False):
                          [os.path.join("implicit", name + src_ext)],
                          language='c++',
                          extra_compile_args=compile_args, extra_link_args=link_args)
-               for name in ['_als', '_nearest_neighbours', 'bpr']]
+               for name in ['_als', '_nearest_neighbours', 'bpr', 'lmf', 'evaluation']]
+    modules.append(Extension("implicit." + 'recommender_base',
+                             [os.path.join("implicit", 'recommender_base' + src_ext),
+                              os.path.join("implicit", 'topnc.cpp')],
+                             language='c++',
+                             extra_compile_args=compile_args, extra_link_args=link_args))
 
     if CUDA:
         modules.append(Extension("implicit.cuda._cuda",
@@ -65,7 +70,6 @@ def define_extensions(use_cython=False):
                                  extra_link_args=link_args,
                                  library_dirs=[CUDA['lib64']],
                                  libraries=['cudart', 'cublas', 'curand'],
-                                 runtime_library_dirs=[CUDA['lib64']],
                                  include_dirs=[CUDA['include'], '.']))
     else:
         print("Failed to find CUDA toolkit. Building without GPU acceleration.")
@@ -119,16 +123,25 @@ def set_gcc():
 
 set_gcc()
 
+try:
+    # if we don't have pandoc installed, don't worry about it
+    import pypandoc
+    long_description = pypandoc.convert_file("README.md", "rst")
+except ImportError:
+    long_description = ''
+
+
 setup(
     name=NAME,
     version=VERSION,
     description='Collaborative Filtering for Implicit Datasets',
+    long_description=long_description,
     url='http://github.com/benfred/implicit/',
     author='Ben Frederickson',
     author_email='ben@benfrederickson.com',
     license='MIT',
     classifiers=[
-        'Development Status :: 3 - Alpha',
+        'Development Status :: 4 - Beta',
         'Natural Language :: English',
         'Intended Audience :: Science/Research',
         'License :: OSI Approved :: MIT License',
@@ -143,8 +156,8 @@ setup(
              'Collaborative Filtering, Recommender Systems',
 
     packages=find_packages(),
-    install_requires=['numpy', 'scipy>=0.16'],
-    setup_requires=["Cython >= 0.24"],
+    install_requires=['numpy', 'scipy>=0.16', 'tqdm>=4.27'],
+    setup_requires=["Cython>=0.24"],
     ext_modules=define_extensions(use_cython),
     cmdclass={'build_ext': build_ext},
     test_suite="tests",

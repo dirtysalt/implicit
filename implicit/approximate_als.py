@@ -8,7 +8,10 @@ import logging
 
 import numpy
 
+import implicit.cuda
 from implicit.als import AlternatingLeastSquares
+
+log = logging.getLogger("implicit")
 
 
 def augment_inner_product_matrix(factors):
@@ -64,9 +67,9 @@ class NMSLibAlternatingLeastSquares(AlternatingLeastSquares):
                  approximate_similar_items=True, approximate_recommend=True,
                  method='hnsw', index_params=None, query_params=None, *args, **kwargs):
         if index_params is None:
-            index_params = {'M': 32, 'post': 2, 'efConstruction': 800}
+            index_params = {'M': 16, 'post': 0, 'efConstruction': 400}
         if query_params is None:
-            query_params = {'ef': 50}
+            query_params = {'ef': 90}
 
         self.similar_items_index = None
         self.recommend_index = None
@@ -80,17 +83,18 @@ class NMSLibAlternatingLeastSquares(AlternatingLeastSquares):
 
         super(NMSLibAlternatingLeastSquares, self).__init__(*args, **kwargs)
 
-    def fit(self, Ciu):
+    def fit(self, Ciu, show_progress=True):
         # nmslib can be a little chatty when first imported, disable some of
         # the logging
         logging.getLogger('nmslib').setLevel(logging.WARNING)
         import nmslib
 
         # train the model
-        super(NMSLibAlternatingLeastSquares, self).fit(Ciu)
+        super(NMSLibAlternatingLeastSquares, self).fit(Ciu, show_progress)
 
         # create index for similar_items
         if self.approximate_similar_items:
+            log.debug("Building nmslib similar items index")
             self.similar_items_index = nmslib.init(
                 method=self.method, space='cosinesimil')
 
@@ -105,18 +109,20 @@ class NMSLibAlternatingLeastSquares(AlternatingLeastSquares):
             ids = ids[norms != 0]
 
             self.similar_items_index.addDataPointBatch(item_factors, ids=ids)
-            self.similar_items_index.createIndex(self.index_params)
+            self.similar_items_index.createIndex(self.index_params,
+                                                 print_progress=show_progress)
             self.similar_items_index.setQueryTimeParams(self.query_params)
 
         # build up a separate index for the inner product (for recommend
         # methods)
         if self.approximate_recommend:
+            log.debug("Building nmslib recommendation index")
             self.max_norm, extra = augment_inner_product_matrix(
                 self.item_factors)
             self.recommend_index = nmslib.init(
                 method='hnsw', space='cosinesimil')
             self.recommend_index.addDataPointBatch(extra)
-            self.recommend_index.createIndex(self.index_params)
+            self.recommend_index.createIndex(self.index_params, print_progress=show_progress)
             self.recommend_index.setQueryTimeParams(self.query_params)
 
     def similar_items(self, itemid, N=10):
@@ -194,28 +200,33 @@ class AnnoyAlternatingLeastSquares(AlternatingLeastSquares):
         self.n_trees = n_trees
         self.search_k = search_k
 
-    def fit(self, Ciu):
+    def fit(self, Ciu, show_progress=True):
         # delay loading the annoy library in case its not installed here
         import annoy
 
         # train the model
-        super(AnnoyAlternatingLeastSquares, self).fit(Ciu)
+        super(AnnoyAlternatingLeastSquares, self).fit(Ciu, show_progress)
 
         # build up an Annoy Index with all the item_factors (for calculating
         # similar items)
-        self.similar_items_index = annoy.AnnoyIndex(
-            self.item_factors.shape[1], 'angular')
-        for i, row in enumerate(self.item_factors):
-            self.similar_items_index.add_item(i, row)
-        self.similar_items_index.build(self.n_trees)
+        if self.approximate_similar_items:
+            log.debug("Building annoy similar items index")
+
+            self.similar_items_index = annoy.AnnoyIndex(
+                self.item_factors.shape[1], 'angular')
+            for i, row in enumerate(self.item_factors):
+                self.similar_items_index.add_item(i, row)
+            self.similar_items_index.build(self.n_trees)
 
         # build up a separate index for the inner product (for recommend
         # methods)
-        self.max_norm, extra = augment_inner_product_matrix(self.item_factors)
-        self.recommend_index = annoy.AnnoyIndex(extra.shape[1], 'angular')
-        for i, row in enumerate(extra):
-            self.recommend_index.add_item(i, row)
-        self.recommend_index.build(self.n_trees)
+        if self.approximate_recommend:
+            log.debug("Building annoy recommendation index")
+            self.max_norm, extra = augment_inner_product_matrix(self.item_factors)
+            self.recommend_index = annoy.AnnoyIndex(extra.shape[1], 'angular')
+            for i, row in enumerate(extra):
+                self.recommend_index.add_item(i, row)
+            self.recommend_index.build(self.n_trees)
 
     def similar_items(self, itemid, N=10):
         if not self.approximate_similar_items:
@@ -269,7 +280,7 @@ class FaissAlternatingLeastSquares(AlternatingLeastSquares):
         The number of cells to use when building the Faiss index.
     nprobe : int, optional
         The number of cells to visit to perform a search.
-    gpu : bool, optional
+    use_gpu : bool, optional
         Whether or not to enable run Faiss on the GPU. Requires faiss to have been
         built with GPU support.
     approximate_similar_items : bool, optional
@@ -289,36 +300,36 @@ class FaissAlternatingLeastSquares(AlternatingLeastSquares):
     """
 
     def __init__(self, approximate_similar_items=True, approximate_recommend=True,
-                 nlist=400, nprobe=20, gpu=False, *args, **kwargs):
+                 nlist=400, nprobe=20, use_gpu=implicit.cuda.HAS_CUDA, *args, **kwargs):
         self.similar_items_index = None
         self.recommend_index = None
 
         self.approximate_similar_items = approximate_similar_items
         self.approximate_recommend = approximate_recommend
-        self.gpu = gpu
 
         # hyper-parameters for FAISS
         self.nlist = nlist
         self.nprobe = nprobe
-        super(FaissAlternatingLeastSquares, self).__init__(*args, **kwargs)
+        super(FaissAlternatingLeastSquares, self).__init__(*args, use_gpu=use_gpu, **kwargs)
 
-    def fit(self, Ciu):
+    def fit(self, Ciu, show_progress=True):
         import faiss
 
         # train the model
-        super(FaissAlternatingLeastSquares, self).fit(Ciu)
+        super(FaissAlternatingLeastSquares, self).fit(Ciu, show_progress)
 
         self.quantizer = faiss.IndexFlat(self.factors)
 
-        if self.gpu:
+        if self.use_gpu:
             self.gpu_resources = faiss.StandardGpuResources()
 
         item_factors = self.item_factors.astype('float32')
 
         if self.approximate_recommend:
-            # build up a inner product index here
+            log.debug("Building faiss recommendation index")
 
-            if self.gpu:
+            # build up a inner product index here
+            if self.use_gpu:
                 index = faiss.GpuIndexIVFFlat(self.gpu_resources, self.factors, self.nlist,
                                               faiss.METRIC_INNER_PRODUCT)
             else:
@@ -331,13 +342,15 @@ class FaissAlternatingLeastSquares(AlternatingLeastSquares):
             self.recommend_index = index
 
         if self.approximate_similar_items:
+            log.debug("Building faiss similar items index")
+
             # likewise build up cosine index for similar_items, using an inner product
             # index on normalized vectors`
             norms = numpy.linalg.norm(item_factors, axis=1)
             norms[norms == 0] = 1e-10
 
             normalized = (item_factors.T / norms).T.astype('float32')
-            if self.gpu:
+            if self.use_gpu:
                 index = faiss.GpuIndexIVFFlat(self.gpu_resources, self.factors, self.nlist,
                                               faiss.METRIC_INNER_PRODUCT)
             else:
@@ -350,7 +363,7 @@ class FaissAlternatingLeastSquares(AlternatingLeastSquares):
             self.similar_items_index = index
 
     def similar_items(self, itemid, N=10):
-        if not self.approximate_similar_items:
+        if not self.approximate_similar_items or (self.use_gpu and N >= 1024):
             return super(FaissAlternatingLeastSquares, self).similar_items(itemid, N)
 
         factors = self.item_factors[itemid]
@@ -374,6 +387,14 @@ class FaissAlternatingLeastSquares(AlternatingLeastSquares):
         if filter_items:
             liked.update(filter_items)
         count = N + len(liked)
+
+        # the GPU variant of faiss doesn't support returning more than 1024 results.
+        # fall back to the exact match when this happens
+        if self.use_gpu and count >= 1024:
+            return super(FaissAlternatingLeastSquares,
+                         self).recommend(userid, user_items, N=N,
+                                         filter_items=filter_items,
+                                         recalculate_user=recalculate_user)
 
         # faiss expects multiple queries - convert query to a matrix
         # and results back to single vectors

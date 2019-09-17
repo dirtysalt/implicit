@@ -41,11 +41,18 @@ __global__ void least_squares_cg_kernel(int factors, int user_count, int item_co
         for (int index = indptr[u]; index < indptr[u + 1]; ++index) {
             const float * Yi = &Y[indices[index] * factors];
             float confidence = data[index];
-            temp += (confidence - (confidence - 1) * dot(Yi, x)) * Yi[threadIdx.x];
+
+            if (confidence > 0) {
+                temp += (confidence - (confidence - 1) * dot(Yi, x)) * Yi[threadIdx.x];
+            } else {
+                confidence *= -1;
+                temp += (- (confidence - 1) * dot(Yi, x)) * Yi[threadIdx.x];
+            }
         }
         p[threadIdx.x] = r[threadIdx.x] = temp;
 
         float rsold = dot(r, r);
+        if (rsold < 1e-20) continue;
 
         for (int it = 0; it < cg_steps; ++it) {
             // calculate Ap = YtCuYp - without actually calculating YtCuY
@@ -55,7 +62,10 @@ __global__ void least_squares_cg_kernel(int factors, int user_count, int item_co
             }
             for (int index = indptr[u]; index < indptr[u + 1]; ++index) {
                 const float * Yi = &Y[indices[index] * factors];
-                Ap[threadIdx.x] += (data[index] - 1) * dot(Yi, p) * Yi[threadIdx.x];
+                float confidence = data[index];
+                if (confidence < 0) confidence *= -1;
+
+                Ap[threadIdx.x] += (confidence - 1) * dot(Yi, p) * Yi[threadIdx.x];
             }
 
             // standard CG update
@@ -63,10 +73,10 @@ __global__ void least_squares_cg_kernel(int factors, int user_count, int item_co
             x[threadIdx.x] += alpha * p[threadIdx.x];
             r[threadIdx.x] -= alpha * Ap[threadIdx.x];
             float rsnew = dot(r, r);
-            if (rsnew < 1e-10) break;
+            if (rsnew < 1e-20) break;
             p[threadIdx.x] = r[threadIdx.x] + (rsnew/rsold) * p[threadIdx.x];
             rsold = rsnew;
-
+            __syncthreads();
         }
 
         // this shouldn't happen - but if we hit a NaN in the above code then complain
@@ -159,7 +169,12 @@ void calculate_loss_kernel(int factors, int user_count, int item_count,
         for (int index = indptr[u]; index < indptr[u + 1]; ++index) {
             const float * Yi = &Y[indices[index] * factors];
             float confidence = data[index];
-            temp += ((confidence - 1 ) * dot(Yi, x) - 2 * confidence) * Yi[threadIdx.x];
+            if (confidence > 0) {
+                temp += ((confidence - 1 ) * dot(Yi, x) - 2 * confidence) * Yi[threadIdx.x];
+            } else {
+                confidence *= -1;
+                temp += ((confidence - 1 ) * dot(Yi, x)) * Yi[threadIdx.x];
+            }
             loss += confidence;
             total_confidence += confidence;
         }

@@ -7,6 +7,7 @@ import time
 import numpy as np
 import scipy
 import scipy.sparse
+from tqdm.auto import tqdm
 
 import implicit.cuda
 
@@ -39,7 +40,7 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
     use_cg : bool, optional
         Use a faster Conjugate Gradient solver to calculate factors
     use_gpu : bool, optional
-        Fit on the GPU if available
+        Fit on the GPU if available, default is to run on GPU only if available
     iterations : int, optional
         The number of ALS iterations to use when fitting data
     calculate_training_loss : bool, optional
@@ -58,9 +59,19 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
     """
 
     def __init__(self, factors=100, regularization=0.01, dtype=np.float32,
-                 use_native=True, use_cg=True, use_gpu=False,
+                 use_native=True, use_cg=True, use_gpu=implicit.cuda.HAS_CUDA,
                  iterations=15, calculate_training_loss=False, num_threads=0):
         super(AlternatingLeastSquares, self).__init__()
+
+        # currently there are some issues when training on the GPU when some of the warps
+        # don't have full factors. Round up to be warp aligned.
+        # TODO: figure out where the issue is (best guess is in the
+        # the 'dot' function in 'implicit/cuda/utils/cuh)
+        if use_gpu and factors % 32:
+            padding = 32 - factors % 32
+            log.warning("GPU training requires factor size to be a multiple of 32."
+                        " Increasing factors from %i to %i.", factors, factors + padding)
+            factors += padding
 
         # parameters on how to factorize
         self.factors = factors
@@ -82,7 +93,7 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
 
         check_blas_config()
 
-    def fit(self, item_users):
+    def fit(self, item_users, show_progress=True):
         """ Factorizes the item_users matrix.
 
         After calling this method, the members 'user_factors' and 'item_factors' will be
@@ -102,8 +113,9 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
             Matrix of confidences for the liked items. This matrix should be a csr_matrix where
             the rows of the matrix are the item, the columns are the users that liked that item,
             and the value is the confidence that the user liked the item.
+        show_progress : bool, optional
+            Whether to show a progress bar during fitting
         """
-
         Ciu = item_users
         if not isinstance(Ciu, scipy.sparse.csr_matrix):
             s = time.time()
@@ -127,35 +139,40 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         if self.item_factors is None:
             self.item_factors = np.random.rand(items, self.factors).astype(self.dtype) * 0.01
 
-        log.debug("initialize factors in %s", time.time() - s)
+        log.debug("Initialized factors in %s", time.time() - s)
 
         # invalidate cached norms and squared factors
         self._item_norms = None
         self._YtY = None
 
         if self.use_gpu:
-            return self._fit_gpu(Ciu, Cui)
+            return self._fit_gpu(Ciu, Cui, show_progress)
 
         solver = self.solver
-        # alternate between learning the user_factors from the item_factors and vice-versa
-        for iteration in range(self.iterations):
-            s = time.time()
-            solver(Cui, self.user_factors, self.item_factors, self.regularization,
-                   num_threads=self.num_threads)
-            solver(Ciu, self.item_factors, self.user_factors, self.regularization,
-                   num_threads=self.num_threads)
-            elapsed = time.time() - s
-            log.debug("finished iteration %i in %.3fs", iteration, elapsed)
 
-            if self.calculate_training_loss:
-                loss = _als.calculate_loss(Cui, self.user_factors, self.item_factors,
-                                           self.regularization, num_threads=self.num_threads)
-                log.debug("loss at iteration %i is %s", iteration, loss)
+        log.debug("Running %i ALS iterations", self.iterations)
+        with tqdm(total=self.iterations, disable=not show_progress) as progress:
+            # alternate between learning the user_factors from the item_factors and vice-versa
+            for iteration in range(self.iterations):
+                s = time.time()
+                solver(Cui, self.user_factors, self.item_factors, self.regularization,
+                       num_threads=self.num_threads)
+                solver(Ciu, self.item_factors, self.user_factors, self.regularization,
+                       num_threads=self.num_threads)
+                progress.update(1)
 
-            if self.fit_callback:
-                self.fit_callback(iteration, elapsed)
+                if self.calculate_training_loss:
+                    loss = _als.calculate_loss(Cui, self.user_factors, self.item_factors,
+                                               self.regularization, num_threads=self.num_threads)
+                    progress.set_postfix({"loss": loss})
 
-    def _fit_gpu(self, Ciu_host, Cui_host):
+                if self.fit_callback:
+                    self.fit_callback(iteration, time.time() - s)
+
+        if self.calculate_training_loss:
+            log.info("Final training loss %.4f", loss)
+
+    def _fit_gpu(self, Ciu_host, Cui_host, show_progress=True):
         """ specialized training on the gpu. copies inputs to/from cuda device """
         if not implicit.cuda.HAS_CUDA:
             raise ValueError("No CUDA extension has been built, can't train on GPU.")
@@ -172,20 +189,23 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         Y = implicit.cuda.CuDenseMatrix(self.item_factors.astype(np.float32))
 
         solver = implicit.cuda.CuLeastSquaresSolver(self.factors)
+        log.debug("Running %i ALS iterations", self.iterations)
+        with tqdm(total=self.iterations, disable=not show_progress) as progress:
+            for iteration in range(self.iterations):
+                s = time.time()
+                solver.least_squares(Cui, X, Y, self.regularization, self.cg_steps)
+                solver.least_squares(Ciu, Y, X, self.regularization, self.cg_steps)
+                progress.update(1)
 
-        for iteration in range(self.iterations):
-            s = time.time()
-            solver.least_squares(Ciu, Y, X, self.regularization, self.cg_steps)
-            solver.least_squares(Cui, X, Y, self.regularization, self.cg_steps)
-            elapsed = time.time() - s
-            log.debug("finished iteration %i in %.3fs", iteration, elapsed)
+                if self.fit_callback:
+                    self.fit_callback(iteration, time.time() - s)
 
-            if self.fit_callback:
-                self.fit_callback(iteration, elapsed)
+                if self.calculate_training_loss:
+                    loss = solver.calculate_loss(Cui, X, Y, self.regularization)
+                    progress.set_postfix({"loss": loss})
 
-            if self.calculate_training_loss:
-                loss = solver.calculate_loss(Cui, X, Y, self.regularization)
-                log.debug("loss at iteration %i is %s", iteration, loss)
+        if self.calculate_training_loss:
+            log.info("Final training loss %.4f", loss)
 
         X.to_host(self.user_factors)
         Y.to_host(self.item_factors)
@@ -239,6 +259,9 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         total_score = 0.0
         h = []
         for i, (itemid, confidence) in enumerate(nonzeros(user_items, userid)):
+            if confidence < 0:
+                continue
+
             factor = self.item_factors[itemid]
             # s_u^ij = (y_i^t W^u) y_j
             score = weighted_item.dot(factor) * confidence
@@ -308,8 +331,13 @@ def user_linear_equation(Y, YtY, Cui, u, regularization, n_factors):
 
     for i, confidence in nonzeros(Cui, u):
         factor = Y[i]
+
+        if confidence > 0:
+            b += confidence * factor
+        else:
+            confidence *= -1
+
         A += (confidence - 1) * np.outer(factor, factor)
-        b += confidence * factor
     return A, b
 
 
@@ -330,15 +358,24 @@ def least_squares_cg(Cui, X, Y, regularization, num_threads=0, cg_steps=3):
         # calculate residual error r = (YtCuPu - (YtCuY.dot(Xu)
         r = -YtY.dot(x)
         for i, confidence in nonzeros(Cui, u):
-            r += (confidence - (confidence - 1) * Y[i].dot(x)) * Y[i]
+            if confidence > 0:
+                r += (confidence - (confidence - 1) * Y[i].dot(x)) * Y[i]
+            else:
+                confidence *= -1
+                r += - (confidence - 1) * Y[i].dot(x) * Y[i]
 
         p = r.copy()
         rsold = r.dot(r)
+        if rsold < 1e-20:
+            continue
 
         for it in range(cg_steps):
             # calculate Ap = YtCuYp - without actually calculating YtCuY
             Ap = YtY.dot(p)
             for i, confidence in nonzeros(Cui, u):
+                if confidence < 0:
+                    confidence *= -1
+
                 Ap += (confidence - 1) * Y[i].dot(p) * Y[i]
 
             # standard CG update
@@ -346,7 +383,7 @@ def least_squares_cg(Cui, X, Y, regularization, num_threads=0, cg_steps=3):
             x += alpha * p
             r -= alpha * Ap
             rsnew = r.dot(r)
-            if rsnew < 1e-10:
+            if rsnew < 1e-20:
                 break
             p = r + (rsnew / rsold) * p
             rsold = rsnew
